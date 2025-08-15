@@ -1,0 +1,22 @@
+{
+  "did:nexa:6306063d-da31-47a3-9897-bdd33d36fd39": {
+    "username": "darshhan28",
+    "password": "c3660012b73d78f670ceda20f74fdb60b6705bb2d241ba523174ca5b13f01d11",
+    "bio": "",
+    "created_at": "2025-04-23T14:43:46.509540"
+  },
+  "did:nexa:242d7748-e9f7-46c4-8fb2-a0dcce35d75b": {
+    "username": "kavin31",
+    "password": "ee7c5ec49d2bbfe8e05a536326d5078005762d637964beacb58f773a4498fa41",
+    "wallet_address": "Kavinanthan2006",
+    "bio": "",
+    "created_at": "2025-04-25T09:58:05.186866"
+  },
+  "did:nexa:4b9de7cd-643b-467d-9745-7da46fd394ea": {
+    "username": "Sakho115",
+    "password": "3cea5f2d3ad32345590ced723d99a88cea1ef6e7123eca91f4fa5f61e99ae2c6",
+    "wallet_address": "ashoktheweeb",
+    "bio": "",
+    "created_at": "2025-08-15T20:38:01.917037"
+  }
+}
