@@ -1,0 +1,938 @@
+import os
+from werkzeug.utils import secure_filename
+from flask import send_from_directory
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from solana.rpc.api import Client
+from solders.pubkey import Pubkey as PublicKey
+from solana.rpc.types import TokenAccountOpts
+from solana.exceptions import SolanaRpcException
+import uuid
+import jwt
+import datetime
+import requests
+import json
+import os
+import hashlib
+
+# Initialize Flask app
+app = Flask(__name__)
+
+UPLOAD_FOLDER = "uploads"
+ALLOWED_EXTENSIONS = {"png", "jpg", "jpeg", "gif"}
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+def allowed_file(filename):
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
+
+
+CORS(app)
+app.config["SECRET_KEY"] = os.getenv("FLASK_SECRET_KEY", "nexa_secret_key")
+
+# Solana Configuration
+SOLANA_RPC_URL = "https://api.testnet.solana.com"
+TOKEN_MINT_ADDRESS = "7DbWrHcHATbFV1DqMGCuJJ3xDiEiiPfZQk3deEK6PzcL"  # Replace with your actual mint address
+solana_client = Client(SOLANA_RPC_URL)
+
+# IPFS Configuration
+PINATA_API_KEY = os.getenv("PINATA_API_KEY")
+PINATA_API_SECRET = os.getenv("PINATA_API_SECRET")
+PINATA_BASE_URL = "https://api.pinata.cloud/pinning"
+
+# Persistent storage files
+USERS_METADATA_FILE = "users_metadata.json"
+POSTS_METADATA_FILE = "posts_metadata.json"
+MESSAGES_METADATA_FILE = "messages_metadata.json"
+FOLLOWERS_METADATA_FILE = "followers_metadata.json"
+FOLLOWING_METADATA_FILE = "following_metadata.json"
+TRANSFERS_FILE = "transfers.json"
+COINS_METADATA_FILE = "coins_metadata.json"
+
+# ===== Solana Utility Functions =====
+def get_token_balance(wallet_address):
+    """Get the Nexa token balance for a wallet address"""
+    try:
+        pubkey = PublicKey(wallet_address)
+        mint_pubkey = PublicKey(TOKEN_MINT_ADDRESS)
+        
+        token_accounts = solana_client.get_token_accounts_by_owner(
+            pubkey,
+            TokenAccountOpts(mint=mint_pubkey)
+        )
+            
+        if not token_accounts.value:
+            return 0
+            
+        balance = 0
+        for account in token_accounts.value:
+            balance += account.account.data.parsed["info"]["tokenAmount"]["amount"]
+            
+        return int(balance)
+        
+    except (ValueError, SolanaRpcException) as e:
+        print(f"Error fetching balance: {e}")
+        return 0
+
+def verify_token_ownership(wallet_address, min_balance=0):
+    """Verify if wallet holds at least min_balance of Nexa tokens"""
+    try:
+        balance = get_token_balance(wallet_address)
+        return balance >= min_balance
+    except Exception as e:
+        print(f"Verification error: {e}")
+        return False
+
+def log_transfer(tx_signature, from_wallet, to_wallet, amount):
+    """Log a token transfer to transfers.json"""
+    try:
+        transfer_data = {
+            "tx_signature": tx_signature,
+            "from": from_wallet,
+            "to": to_wallet,
+            "amount": amount,
+            "timestamp": datetime.datetime.now().isoformat()
+        }
+        
+        try:
+            with open(TRANSFERS_FILE, "r") as f:
+                transfers = json.load(f)
+        except (FileNotFoundError, json.JSONDecodeError):
+            transfers = []
+            
+        transfers.append(transfer_data)
+        
+        with open(TRANSFERS_FILE, "w") as f:
+            json.dump(transfers, f, indent=2)
+            
+        return True
+    except Exception as e:
+        print(f"Error logging transfer: {e}")
+        return False
+
+# ===== Core Utility Functions =====
+def load_metadata(file_path, default_factory=dict):
+    if os.path.exists(file_path):
+        with open(file_path, "r") as f:
+            data = json.load(f)
+            if isinstance(data, list):
+                return {item['id']: item for item in data} if file_path == POSTS_METADATA_FILE else data
+            return data
+    return default_factory()
+
+def save_metadata(file_path, data):
+    # Convert sets to lists for JSON serialization
+    def convert_sets(obj):
+        if isinstance(obj, dict):
+            return {k: convert_sets(v) for k, v in obj.items()}
+        elif isinstance(obj, set):
+            return list(obj)
+        elif isinstance(obj, list):
+            return [convert_sets(i) for i in obj]
+        else:
+            return obj
+
+    data_to_save = convert_sets(data)
+
+    with open(file_path, "w") as f:
+        if isinstance(data_to_save, dict):
+            json.dump(data_to_save, f, indent=2)
+        else:
+            json.dump(list(data_to_save), f, indent=2)
+
+def generate_did():
+    return f"did:nexa:{uuid.uuid4()}"
+
+def generate_jwt(did):
+    payload = {
+        "did": did,
+        "exp": datetime.datetime.utcnow() + datetime.timedelta(days=1)
+    }
+    return jwt.encode(payload, app.config["SECRET_KEY"], algorithm="HS256")
+
+def decode_jwt(token):
+    try:
+        return jwt.decode(token, app.config["SECRET_KEY"], algorithms=["HS256"])
+    except (jwt.ExpiredSignatureError, jwt.InvalidTokenError):
+        return None
+
+def hash_password(password):
+    return hashlib.sha256(password.encode('utf-8')).hexdigest()
+
+def upload_to_ipfs(data, filename="file"):
+    if PINATA_API_KEY and PINATA_API_SECRET:
+        headers = {
+            "pinata_api_key": PINATA_API_KEY,
+            "pinata_secret_api_key": PINATA_API_SECRET,
+        }
+        files = {'file': (filename, data)}
+        try:
+            res = requests.post(f"{PINATA_BASE_URL}/pinFileToIPFS", files=files, headers=headers)
+            if res.status_code == 200:
+                return res.json()["IpfsHash"]
+        except Exception as e:
+            print("Pinata upload error:", e)
+
+    try:
+        files = {'file': data}
+        res = requests.post("http://127.0.0.1:5001/api/v0/add", files=files)
+        if res.status_code == 200:
+            return res.json()["Hash"]
+    except Exception as e:
+        print("IPFS Upload Error:", e)
+    return None
+
+def download_from_ipfs(cid):
+    try:
+        res = requests.get(f"https://ipfs.io/ipfs/{cid}")
+        if res.status_code == 200:
+            return res.content
+    except Exception as e:
+        print("IPFS Download Error:", e)
+    return None
+
+# ===== Data Initialization =====
+users = load_metadata(USERS_METADATA_FILE)
+posts = load_metadata(POSTS_METADATA_FILE)
+messages = load_metadata(MESSAGES_METADATA_FILE, list)
+followers = load_metadata(FOLLOWERS_METADATA_FILE, dict)
+following = load_metadata(FOLLOWING_METADATA_FILE, dict)
+coins_metadata = load_metadata(COINS_METADATA_FILE, dict)
+
+# Initialize default values for new users
+for did in users:
+    followers.setdefault(did, set())
+    following.setdefault(did, set())
+    coins_metadata.setdefault(did, [])
+
+# ===== API Routes =====
+@app.route("/")
+def home():
+    return jsonify({
+        "message": "Nexa API Server is running",
+        "endpoints": {
+            "auth": ["/api/register", "/api/login"],
+            "posts": ["/api/post", "/api/posts", "/api/reply/<parent_id>"],
+            "social": ["/api/follow/<target_did>", "/api/followers/<did>", "/api/following/<did>"],
+            "coins": ["/api/coins/<did>", "/api/coins/wallet/<wallet_address>", "/api/verify-ownership", "/api/token-transfers"],
+            "messages": ["/api/message", "/api/messages/<did>", "/api/messages/between"],
+            "ai": ["/api/ai/chat", "/api/ai/history", "/api/ai/clear"]
+        }
+    })
+
+# ==== Auth & User Routes ====
+@app.route("/api/register", methods=["POST"])
+def register():
+    data = request.get_json()
+    username = data.get("username")
+    password = data.get("password")
+    wallet_address = data.get("wallet_address")
+    
+    if not username or not password or not wallet_address:
+        return jsonify({"error": "Username, password and wallet address required"}), 400
+    
+    if any(user['username'] == username for user in users.values()):
+        return jsonify({"error": "Username already exists"}), 400
+
+    hashed_password = hash_password(password)
+    did = generate_did()
+    users[did] = {
+        "username": username,
+        "password": hashed_password,
+        "wallet_address": wallet_address,
+        "bio": "",
+        "created_at": datetime.datetime.now().isoformat()
+    }
+    followers[did] = set()
+    following[did] = set()
+    
+    save_metadata(USERS_METADATA_FILE, users)
+    save_metadata(FOLLOWERS_METADATA_FILE, followers)
+    save_metadata(FOLLOWING_METADATA_FILE, following)
+    
+    token = generate_jwt(did)
+    return jsonify({
+        "did": did,
+        "token": token,
+        "username": username,
+        "wallet_address": wallet_address
+    })
+
+@app.route("/api/login", methods=["POST"])
+def login():
+    try:
+        data = request.get_json()
+        print("Login data received:", data)
+        username = data.get("username")
+        password = data.get("password")
+
+        if not username or not password:
+            return jsonify({"error": "Username and password required"}), 400
+
+        user = next((u for u in users.values() if u["username"] == username), None)
+        if user and user["password"] == hash_password(password):
+            did = next(did for did, u in users.items() if u == user)
+            token = generate_jwt(did)
+            print("Login successful for user:", username)
+            wallet_address = user.get("wallet_address", "")
+            return jsonify({
+                "token": token,
+                "did": did,
+                "username": username,
+                "wallet_address": wallet_address
+            })
+        else:
+            print("Invalid username or password for user:", username)
+            return jsonify({"error": "Invalid username or password"}), 401
+    except Exception as e:
+        print("Exception during login:", e)
+        return jsonify({"error": "Internal server error"}), 500
+
+@app.route("/api/profile/<did>", methods=["GET", "POST"])
+def profile(did):
+    if request.method == "GET":
+        user = users.get(did)
+        if not user:
+            return jsonify({"error": "User not found"}), 404
+        
+        return jsonify({
+            "username": user["username"],
+            "wallet_address": user["wallet_address"],
+            "bio": user["bio"],
+            "created_at": user.get("created_at"),
+            "followers_count": len(followers.get(did, [])),
+            "following_count": len(following.get(did, [])),
+            "posts_count": len([p for p in posts.values() if p["did"] == did])
+        })
+
+    elif request.method == "POST":
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        payload = decode_jwt(token)
+        if not payload or payload["did"] != did:
+            return jsonify({"error": "Unauthorized"}), 403
+
+        data = request.get_json()
+        bio = data.get("bio")
+        if not bio:
+            return jsonify({"error": "Bio is required"}), 400
+        
+        users[did]["bio"] = bio
+        save_metadata(USERS_METADATA_FILE, users)
+        return jsonify({"message": "Profile updated", "bio": bio})
+
+# ==== Posts Routes ====
+@app.route("/api/post", methods=["POST"])
+def create_post():
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+
+    did = payload["did"]
+    content = request.form.get("content", "")
+    parent_id = request.form.get("parent_id")
+    file = request.files.get("file")
+
+    if not content and not file:
+        return jsonify({"error": "Content or file required"}), 400
+
+    cid = upload_to_ipfs(file.read() if file else content.encode(), filename=f"post_{datetime.datetime.now().timestamp()}")
+    if not cid:
+        return jsonify({"error": "IPFS upload failed"}), 500
+
+    post_id = str(uuid.uuid4())
+    post = {
+        "id": post_id,
+        "did": did,
+        "username": users[did]["username"],
+        "content": content,
+        "cid": cid,
+        "preview": f"https://ipfs.io/ipfs/{cid}",
+        "timestamp": datetime.datetime.now().isoformat(),
+        "likes": 0,
+        "parent_id": parent_id,
+        "replies_count": 0
+    }
+    
+    if parent_id and parent_id in posts:
+        posts[parent_id]["replies_count"] = posts[parent_id].get("replies_count", 0) + 1
+    
+    posts[post_id] = post
+    save_metadata(POSTS_METADATA_FILE, posts)
+    
+    return jsonify({
+        "message": "Post created",
+        "post": post
+    })
+@app.route("/api/upload-avatar", methods=["POST"])
+def upload_avatar():
+    """Upload and update user avatar with JWT validation."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+    
+    if 'avatar' not in request.files:
+        return jsonify({"error": "No file provided"}), 400
+    
+    file = request.files['avatar']
+    if file.filename == '':
+        return jsonify({"error": "No file selected"}), 400
+    
+    # Validate file type
+    allowed_extensions = {'png', 'jpg', 'jpeg', 'gif', 'webp'}
+    file_extension = file.filename.rsplit('.', 1)[1].lower()
+    
+    if file_extension not in allowed_extensions:
+        return jsonify({"error": "Invalid file type. Only PNG, JPG, JPEG, GIF, and WebP are allowed"}), 400
+    
+    # Validate file size (max 5MB)
+    file.seek(0, 2)
+    file_size = file.tell()
+    file.seek(0)
+    
+    if file_size > 5 * 1024 * 1024:  # 5MB
+        return jsonify({"error": "File size too large. Maximum 5MB allowed"}), 400
+    
+    try:
+        # Generate unique filename based on user DID
+        user_did = payload["did"]
+        filename = f"{user_did}_avatar.{file_extension}"
+        file_path = os.path.join(app.config["UPLOAD_FOLDER"], filename)
+        
+        # Save file
+        file.save(file_path)
+        
+        # Update user avatar in database
+        if user_did in users:
+            avatar_url = f"/uploads/{filename}"
+            users[user_did]["avatar"] = avatar_url
+            save_metadata(USERS_METADATA_FILE, users)
+            
+            return jsonify({
+                "success": True,
+                "url": avatar_url,
+                "message": "Avatar updated successfully"
+            })
+        
+        return jsonify({"error": "User not found"}), 404
+        
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/posts", methods=["GET"])
+def get_posts():
+    page = int(request.args.get("page", 1))
+    limit = int(request.args.get("limit", 20))
+    offset = (page - 1) * limit
+    
+    sorted_posts = sorted(posts.values(), key=lambda x: x["timestamp"], reverse=True)
+    paginated_posts = sorted_posts[offset:offset + limit]
+    
+    return jsonify({
+        "posts": paginated_posts,
+        "total": len(posts),
+        "page": page,
+        "limit": limit
+    })
+
+@app.route("/api/post/<post_id>", methods=["GET", "DELETE"])
+def post_detail(post_id):
+    if request.method == "GET":
+        post = posts.get(post_id)
+        if not post:
+            return jsonify({"error": "Post not found"}), 404
+        
+        replies = [p for p in posts.values() if p.get("parent_id") == post_id]
+        
+        return jsonify({
+            "post": post,
+            "replies": sorted(replies, key=lambda x: x["timestamp"], reverse=True)
+        })
+    
+    elif request.method == "DELETE":
+        token = request.headers.get("Authorization", "").replace("Bearer ", "")
+        payload = decode_jwt(token)
+        if not payload:
+            return jsonify({"error": "Invalid or expired token"}), 403
+        
+        post = posts.get(post_id)
+        if not post:
+            return jsonify({"error": "Post not found"}), 404
+        
+        if post["did"] != payload["did"]:
+            return jsonify({"error": "Unauthorized to delete this post"}), 403
+        
+        if post.get("parent_id") and post["parent_id"] in posts:
+            posts[post["parent_id"]]["replies_count"] = max(0, posts[post["parent_id"]].get("replies_count", 0) - 1)
+        
+        del posts[post_id]
+        save_metadata(POSTS_METADATA_FILE, posts)
+        return jsonify({"message": "Post deleted"})
+
+@app.route("/api/search", methods=["GET"])
+def search_posts():
+    query = request.args.get("q", "").lower()
+    if not query or len(query) < 3:
+        return jsonify({"error": "Query must be at least 3 characters"}), 400
+    
+    results = [
+        p for p in posts.values() 
+        if query in p["content"].lower() or 
+           query in p["username"].lower()
+    ]
+    return jsonify(sorted(results, key=lambda x: x["timestamp"], reverse=True))
+
+@app.route("/api/like/<post_id>", methods=["POST"])
+def like_post(post_id):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+    
+    post = posts.get(post_id)
+    if not post:
+        return jsonify({"error": "Post not found"}), 404
+    
+    did = payload["did"]
+    if "likes" not in post:
+        post["likes"] = 0
+    if "liked_by" not in post:
+        post["liked_by"] = []
+    
+    if did in post["liked_by"]:
+        return jsonify({"error": "Already liked this post"}), 400
+    
+    post["likes"] += 1
+    post["liked_by"].append(did)
+    save_metadata(POSTS_METADATA_FILE, posts)
+    
+    return jsonify({
+        "message": "Post liked",
+        "likes": post["likes"]
+    })
+
+# ==== Social Routes ====
+@app.route("/api/follow/<target_did>", methods=["POST"])
+def follow_user(target_did):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 403
+
+    did = payload["did"]
+    if target_did not in users or did == target_did:
+        return jsonify({"error": "Invalid user"}), 400
+
+    if did in followers.get(target_did, set()):
+        return jsonify({"error": "Already following this user"}), 400
+
+    followers.setdefault(target_did, set()).add(did)
+    following.setdefault(did, set()).add(target_did)
+
+    save_metadata(FOLLOWERS_METADATA_FILE, followers)
+    save_metadata(FOLLOWING_METADATA_FILE, following)
+
+    return jsonify({
+        "message": f"Now following {users[target_did]['username']}",
+        "following": list(following[did])
+    })
+
+@app.route("/api/unfollow/<target_did>", methods=["POST"])
+def unfollow_user(target_did):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 403
+
+    did = payload["did"]
+    if target_did not in users or did == target_did:
+        return jsonify({"error": "Invalid user"}), 400
+
+    if did not in followers.get(target_did, set()):
+        return jsonify({"error": "Not following this user"}), 400
+
+    followers[target_did].discard(did)
+    following[did].discard(target_did)
+
+    save_metadata(FOLLOWERS_METADATA_FILE, followers)
+    save_metadata(FOLLOWING_METADATA_FILE, following)
+
+    return jsonify({
+        "message": f"Unfollowed {users[target_did]['username']}",
+        "following": list(following[did])
+    })
+
+@app.route("/api/followers/<did>", methods=["GET"])
+def get_followers(did):
+    if did not in users:
+        return jsonify({"error": "User not found"}), 404
+    
+    followers_list = []
+    for follower_did in followers.get(did, set()):
+        follower = users.get(follower_did)
+        if follower:
+            followers_list.append({
+                "did": follower_did,
+                "username": follower["username"],
+                "bio": follower.get("bio", "")
+            })
+    
+    return jsonify({
+        "followers": followers_list,
+        "count": len(followers_list)
+    })
+
+@app.route("/api/following/<did>", methods=["GET"])
+def get_following(did):
+    if did not in users:
+        return jsonify({"error": "User not found"}), 404
+    
+    following_list = []
+    for following_did in following.get(did, set()):
+        user = users.get(following_did)
+        if user:
+            following_list.append({
+                "did": following_did,
+                "username": user["username"],
+                "bio": user.get("bio", "")
+            })
+    
+    return jsonify({
+        "following": following_list,
+        "count": len(following_list)
+    })
+
+# ==== Solana Token Routes ====
+@app.route("/api/coins/<did>", methods=["GET"])
+def get_coin_balance(did):
+    if did not in users:
+        return jsonify({"error": "User not found"}), 404
+    
+    wallet_address = users[did].get("wallet_address")
+    if not wallet_address:
+        return jsonify({"error": "No wallet address found"}), 404
+    
+    try:
+        balance = get_token_balance(wallet_address)
+        history = coins_metadata.get(did, [])
+        return jsonify({
+            "did": did,
+            "wallet_address": wallet_address,
+            "balance": balance,
+            "history": history
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/coins/wallet/<wallet_address>", methods=["GET"])
+def get_wallet_balance(wallet_address):
+    try:
+        balance = get_token_balance(wallet_address)
+        return jsonify({
+            "wallet_address": wallet_address,
+            "balance": balance
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/verify-ownership", methods=["POST"])
+def verify_ownership():
+    data = request.get_json()
+    wallet_address = data.get("wallet")
+    min_balance = data.get("min_balance", 0)
+    
+    if not wallet_address:
+        return jsonify({"error": "Wallet address required"}), 400
+    
+    try:
+        is_owner = verify_token_ownership(wallet_address, min_balance)
+        return jsonify({
+            "wallet_address": wallet_address,
+            "is_owner": is_owner,
+            "min_balance": min_balance
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/token-transfers", methods=["POST"])
+def log_token_transfer():
+    data = request.get_json()
+    tx_signature = data.get("tx_signature")
+    from_wallet = data.get("from")
+    to_wallet = data.get("to")
+    amount = data.get("amount")
+    
+    if not all([tx_signature, from_wallet, to_wallet, amount]):
+        return jsonify({"error": "All transfer fields required"}), 400
+    
+    try:
+        success = log_transfer(tx_signature, from_wallet, to_wallet, amount)
+        if success:
+            # Update coins_metadata for from_wallet and to_wallet
+            from_did = None
+            to_did = None
+            for did, user in users.items():
+                if user.get("wallet_address") == from_wallet:
+                    from_did = did
+                if user.get("wallet_address") == to_wallet:
+                    to_did = did
+            
+            timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            
+            if from_did:
+                coins_metadata.setdefault(from_did, [])
+                coins_metadata[from_did].append({
+                    "id": tx_signature + "-sent",
+                    "amount": -amount,
+                    "type": "sent",
+                    "description": f"Sent to {to_did or to_wallet}",
+                    "timestamp": timestamp
+                })
+            
+            if to_did:
+                coins_metadata.setdefault(to_did, [])
+                coins_metadata[to_did].append({
+                    "id": tx_signature + "-received",
+                    "amount": amount,
+                    "type": "received",
+                    "description": f"Received from {from_did or from_wallet}",
+                    "timestamp": timestamp
+                })
+            
+            save_metadata(COINS_METADATA_FILE, coins_metadata)
+            
+            return jsonify({"message": "Transfer logged successfully"})
+        return jsonify({"error": "Failed to log transfer"}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/leaderboard", methods=["GET"])
+def coin_leaderboard():
+    try:
+        leaderboard = []
+        for did, user in users.items():
+            wallet_address = user.get("wallet_address")
+            if wallet_address:
+                balance = get_token_balance(wallet_address)
+                leaderboard.append({
+                    "did": did,
+                    "username": user["username"],
+                    "wallet_address": wallet_address,
+                    "balance": balance,
+                    "bio": user.get("bio", "")
+                })
+        
+        leaderboard.sort(key=lambda x: x["balance"], reverse=True)
+        return jsonify(leaderboard[:20])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==== AI Assistant Routes ====
+from data.Gemini import gemini_service
+
+@app.route("/api/ai/chat", methods=["POST"])
+def ai_chat():
+    """Send a message to the AI assistant."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+
+    user_id = payload["did"]
+    data = request.get_json()
+    message = data.get("message")
+    
+    if not message:
+        return jsonify({"error": "Message is required"}), 400
+    
+    if len(message.strip()) == 0:
+        return jsonify({"error": "Message cannot be empty"}), 400
+    
+    try:
+        response = gemini_service.send_message(user_id, message)
+        return jsonify(response)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/ai/history", methods=["GET"])
+def get_ai_history():
+    """Get the AI chat history for the authenticated user."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+
+    user_id = payload["did"]
+    
+    try:
+        history = gemini_service.get_chat_history(user_id)
+        return jsonify({"history": history})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/ai/clear", methods=["POST"])
+def clear_ai_chat():
+    """Clear the AI chat history for the authenticated user."""
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+
+    user_id = payload["did"]
+    
+    try:
+        result = gemini_service.clear_chat(user_id)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ==== Messaging Routes ====
+@app.route("/api/message", methods=["POST"])
+def send_message():
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid or expired token"}), 403
+
+    sender_did = payload["did"]
+    data = request.get_json()
+    receiver_did = data.get("receiver_did")
+    message_content = data.get("message_content")
+
+    if not receiver_did or not message_content:
+        return jsonify({"error": "Receiver DID and message content required"}), 400
+
+    if receiver_did not in users:
+        return jsonify({"error": "Receiver not found"}), 404
+
+    if sender_did == receiver_did:
+        return jsonify({"error": "Cannot send message to yourself"}), 400
+
+    cid = upload_to_ipfs(message_content.encode(), filename=f"message_{datetime.datetime.now().timestamp()}")
+    if not cid:
+        return jsonify({"error": "IPFS upload failed"}), 500
+
+    message = {
+        "id": str(uuid.uuid4()),
+        "sender_did": sender_did,
+        "sender_username": users[sender_did]["username"],
+        "receiver_did": receiver_did,
+        "receiver_username": users[receiver_did]["username"],
+        "cid": cid,
+        "preview": message_content[:100],
+        "timestamp": datetime.datetime.now().isoformat(),
+        "read": False
+    }
+
+    messages.append(message)
+    save_metadata(MESSAGES_METADATA_FILE, messages)
+
+    return jsonify({
+        "message": "Message sent",
+        "message_id": message["id"],
+        "preview": message["preview"]
+    })
+
+@app.route("/api/messages/<did>", methods=["GET"])
+def get_messages(did):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload or payload["did"] != did:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    user_messages = [
+        msg for msg in messages 
+        if msg["sender_did"] == did or msg["receiver_did"] == did
+    ]
+
+    for msg in user_messages:
+        if msg["receiver_did"] == did and not msg["read"]:
+            msg["read"] = True
+    
+    save_metadata(MESSAGES_METADATA_FILE, messages)
+
+    return jsonify(sorted(
+        user_messages,
+        key=lambda x: x["timestamp"],
+        reverse=True
+    ))
+
+@app.route("/api/messages/between", methods=["GET"])
+def get_messages_between():
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 403
+
+    user_did = payload["did"]
+    other_did = request.args.get("other_did")
+    
+    if not other_did or other_did not in users:
+        return jsonify({"error": "Invalid user"}), 400
+
+    conversation = [
+        msg for msg in messages 
+        if (msg["sender_did"] == user_did and msg["receiver_did"] == other_did) or
+           (msg["sender_did"] == other_did and msg["receiver_did"] == user_did)
+    ]
+
+    for msg in conversation:
+        if msg["receiver_did"] == user_did and not msg["read"]:
+            msg["read"] = True
+    
+    save_metadata(MESSAGES_METADATA_FILE, messages)
+
+    return jsonify(sorted(
+        conversation,
+        key=lambda x: x["timestamp"],
+        reverse=True
+    ))
+
+@app.route("/api/message/<message_id>", methods=["GET", "DELETE"])
+def message_detail(message_id):
+    token = request.headers.get("Authorization", "").replace("Bearer ", "")
+    payload = decode_jwt(token)
+    if not payload:
+        return jsonify({"error": "Invalid token"}), 403
+
+    message = next((msg for msg in messages if msg["id"] == message_id), None)
+    if not message:
+        return jsonify({"error": "Message not found"}), 404
+
+    user_did = payload["did"]
+    if user_did not in [message["sender_did"], message["receiver_did"]]:
+        return jsonify({"error": "Unauthorized"}), 403
+
+    if request.method == "GET":
+        content = download_from_ipfs(message["cid"])
+        if not content:
+            return jsonify({"error": "Failed to retrieve message content"}), 500
+
+        if message["receiver_did"] == user_did and not message["read"]:
+            message["read"] = True
+            save_metadata(MESSAGES_METADATA_FILE, messages)
+
+        return jsonify({
+            **message,
+            "content": content.decode("utf-8")
+        })
+
+    elif request.method == "DELETE":
+        if message["sender_did"] != user_did:
+            return jsonify({"error": "Only sender can delete messages"}), 403
+
+        messages.remove(message)
+        save_metadata(MESSAGES_METADATA_FILE, messages)
+        return jsonify({"message": "Message deleted"})
+
+# ==== Server Startup ====
+@app.route("/uploads/<filename>")
+def uploaded_file(filename):
+    return send_from_directory(app.config["UPLOAD_FOLDER"], filename)
+
+if __name__ == "__main__":
+    os.makedirs("data", exist_ok=True)
+    app.run(host="0.0.0.0", port=5000, debug=True)

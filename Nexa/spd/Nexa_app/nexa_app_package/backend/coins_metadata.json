@@ -1,0 +1,18 @@
+{
+  "did:nexa:example-user-1": [
+    {
+      "id": "tx1",
+      "amount": 10,
+      "type": "earned",
+      "description": "Initial reward",
+      "timestamp": "2024-01-01T12:00:00Z"
+    },
+    {
+      "id": "tx2",
+      "amount": 5,
+      "type": "spent",
+      "description": "Tip to user 2",
+      "timestamp": "2024-01-02T15:30:00Z"
+    }
+  ]
+}
